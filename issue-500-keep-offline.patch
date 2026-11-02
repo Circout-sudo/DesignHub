@@ -1,0 +1,856 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3c64404..08dc9c9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Keep studios for offline use now: **Brand Projects, Storage, Keep studios for offline use** lists the studios with whether each is kept, and **Keep selected** keeps the ticked ones before they are ever opened, one message to the service worker per studio, with progress and the size added, and nothing fetched until the button is pressed. A studio is kept whole or not at all (its page only once all of its files are stored), a retry fetches only what is missing, and the panel says which studios are not ready and whether the device ran out of room. The sidebar marker updates at once and an end-to-end test keeps a studio that was never opened, goes offline and opens it. Strings in en, es, fr and hi. See [docs/storage.md](docs/storage.md).
++
+ - Screenshot tests of the home page and two studios at three widths in light and dark (`tests/e2e/visual.spec.ts`, run by `visual.yml` on its Linux image; run the workflow by hand with "update" ticked to make the images).
+ - Tests for the windowing helper, the version deltas and storage, the storage report, the social pack and its cancel, the project search, the logo variant sets, and the end-to-end flows these touch (export format link, prefetch, language chunks, icon grid, project list, storage panel, version restore, modes, panels, pickers).
+ - Page sections in the Brand Guidelines page list: the pages are grouped as Foundation, Logo, Color, Type, Imagery, UI, Voice and Tokens (a `section` on every `GuidelinePage`), each section folds, has a switch that turns all of its pages on or off, and shows how many of its pages are on while folded. The cover stays on, and page numbers, the contents, the PDF bookmarks, the website and the Markdown export follow the pages that are left. Tests cover every page having a section and a section that is off being left out of each export.
+diff --git a/README.md b/README.md
+index 00facd9..5785c07 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,7 @@ A typical design session bounces between a font site, a palette generator, a con
+ - **One source of truth** - change a color or font once and every logo variant, mockup, social asset, guideline page and token file updates.
+ - **Local first** - brands, projects, palettes and settings persist in IndexedDB.
+ - **No login, no backend** - there is no server to send your work to.
+-- **Offline first** - a studio you have opened once with a connection works without one; icons you have opened are cached for offline use.
++- **Offline first** - a studio you have opened once with a connection works without one (or keep studios ahead of time from Brand Projects, Storage); icons you have opened are cached for offline use.
+ - **Calm by default** - a short home page, a short command palette, folded groups and panels, one pane at a time on a phone, a sidebar that collapses to icons, and a Simple mode that shows the common controls first (Advanced shows the rest).
+ - **Keyboard first** - `⌘K` for everything, `G` + letter to jump, `Space` to shuffle.
+ - **Production ready** - exports drop straight into CSS, SCSS, Tailwind (v3 and v4), React and Vue, plus PNG, PDF and ZIP asset packs.
+@@ -279,7 +279,7 @@ It imports the same generators the app uses, so the files match what the Export
+ 
+ ### PWA and offline development
+ 
+-Production builds register a service worker that installs only the app shell (about 0.6 MB gzipped) and keeps each studio, its page and its files, the first time you open it online. Google Fonts and Iconify responses are cached at runtime, so a studio that has been visited online can be reopened while offline. A studio you never opened online says so when you are offline.
++Production builds register a service worker that installs only the app shell (about 0.6 MB gzipped) and keeps each studio, its page and its files, the first time you open it online. Google Fonts and Iconify responses are cached at runtime, so a studio that has been visited online can be reopened while offline. A studio you never opened online says so when you are offline. A studio can also be kept ahead of time from **Brand Projects, Storage**: the page sends `REMEMBER_ROUTE` with a port and the worker answers with what it stored (see [docs/storage.md](docs/storage.md)).
+ 
+ Installed in Chromium, the app also registers as a handler for `.designhub.json` files (double click one to open the import prompt) and as a share target for project files. The icon menu also jumps straight to Colors, Typography, Brand Projects and the Export Engine. Both file features are handled on the device, validate and sanitize the file like a normal import, and ask before adding anything. If install, file open, share target or a stale offline cache misbehaves, see [The installed app](docs/troubleshooting.md#the-installed-app).
+ 
+diff --git a/components/projects/keep-offline.tsx b/components/projects/keep-offline.tsx
+new file mode 100644
+index 0000000..80d6a66
+--- /dev/null
++++ b/components/projects/keep-offline.tsx
+@@ -0,0 +1,143 @@
++"use client";
++
++import { useEffect, useState } from "react";
++
++import { useI18n } from "@/components/layout/locale-provider";
++import { Button } from "@/components/ui/button";
++import { useKeptStudios } from "@/hooks/use-kept-studios";
++import { studios } from "@/lib/navigation";
++import { keepStudios, summarize, type KeepSummary } from "@/lib/pwa/keep-studios";
++import { formatBytes } from "@/lib/svg-size";
++
++type Progress = { current: number; total: number; bytes: number };
++
++/**
++ * Keeps studios for offline use now, for someone about to lose their connection. A studio is otherwise kept the
++ * first time it is opened. Nothing is downloaded until the person presses the button.
++ */
++export function KeepOffline({ onKept }: { onKept?: () => void }) {
++  const { t, plural } = useI18n();
++  const { kept } = useKeptStudios();
++  const [worker, setWorker] = useState<ServiceWorker | null>(null);
++  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
++  const [progress, setProgress] = useState<Progress | null>(null);
++  const [summary, setSummary] = useState<KeepSummary | null>(null);
++
++  // The worker answers only once it controls the page: not in development, and not before the first reload.
++  useEffect(() => {
++    if (!("serviceWorker" in navigator)) return;
++    const read = () => setWorker(navigator.serviceWorker.controller);
++    read();
++    navigator.serviceWorker.addEventListener("controllerchange", read);
++    return () => navigator.serviceWorker.removeEventListener("controllerchange", read);
++  }, []);
++
++  const name = (href: string) => {
++    const studio = studios.find((item) => item.href === href);
++    return studio ? t(`studio.${studio.id}.short`) : href;
++  };
++  const names = (hrefs: readonly string[]) => hrefs.map(name).join(", ");
++  const busy = progress !== null;
++  const pending = studios.filter((studio) => !kept.has(studio.href) && selected.has(studio.href));
++
++  function toggle(href: string) {
++    const next = new Set(selected);
++    if (!next.delete(href)) next.add(href);
++    setSelected(next);
++  }
++
++  async function keep() {
++    if (!worker || pending.length === 0) return;
++    setSummary(null);
++    setProgress({ current: 1, total: pending.length, bytes: 0 });
++    const results = await keepStudios(
++      worker,
++      pending.map((studio) => studio.href),
++      setProgress,
++    );
++    setProgress(null);
++    setSummary(summarize(results));
++    // What did not make it stays selected, so one more press tries again.
++    setSelected(new Set(results.filter((result) => result.status !== "kept").map((result) => result.pathname)));
++    onKept?.();
++  }
++
++  return (
++    <section aria-labelledby="keep-offline-title" className="flex flex-col gap-2 border-t pt-2">
++      <h3 id="keep-offline-title" className="text-xs font-medium">
++        {t("projects.storage.keep.title")}
++      </h3>
++      <p className="text-xs text-muted-foreground">{t("projects.storage.keep.description")}</p>
++      {worker ? (
++        <>
++          <ul className="grid gap-x-4 gap-y-1 text-sm sm:grid-cols-2">
++            {studios.map((studio) => {
++              const isKept = kept.has(studio.href);
++              const id = `keep-offline-${studio.id}`;
++              return (
++                <li key={studio.id} className="flex items-center gap-2">
++                  <input
++                    id={id}
++                    type="checkbox"
++                    className="size-4 accent-primary"
++                    aria-describedby={`${id}-state`}
++                    checked={isKept || selected.has(studio.href)}
++                    disabled={isKept || busy}
++                    onChange={() => toggle(studio.href)}
++                  />
++                  <label htmlFor={id} className="flex-1 truncate">
++                    {t(`studio.${studio.id}.short`)}
++                  </label>
++                  <span id={`${id}-state`} className="shrink-0 text-xs text-muted-foreground">
++                    {isKept ? t("projects.storage.keep.kept") : t("projects.storage.keep.notKept")}
++                  </span>
++                </li>
++              );
++            })}
++          </ul>
++          <div className="flex flex-wrap items-center gap-2">
++            <Button
++              variant="outline"
++              size="sm"
++              disabled={busy}
++              onClick={() =>
++                setSelected(new Set(studios.filter((studio) => !kept.has(studio.href)).map((studio) => studio.href)))
++              }
++            >
++              {t("projects.storage.keep.selectAll")}
++            </Button>
++            <Button size="sm" disabled={busy || pending.length === 0} onClick={() => void keep()}>
++              {t("projects.storage.keep.button")}
++            </Button>
++          </div>
++        </>
++      ) : (
++        <p className="text-xs text-muted-foreground">{t("projects.storage.keep.unavailable")}</p>
++      )}
++      <div role="status" className="flex flex-col gap-1 text-xs">
++        {progress ? (
++          <p>
++            {t("projects.storage.keep.progress", {
++              current: progress.current,
++              total: progress.total,
++              size: formatBytes(progress.bytes),
++            })}
++          </p>
++        ) : null}
++        {summary && summary.kept > 0 ? (
++          <p>{plural("projects.storage.keep.done", summary.kept, { size: formatBytes(summary.bytes) })}</p>
++        ) : null}
++        {summary && summary.notReady.length > 0 ? (
++          <p>
++            {t(summary.full ? "projects.storage.keep.full" : "projects.storage.keep.failed", {
++              studios: names(summary.notReady),
++            })}
++          </p>
++        ) : null}
++        {summary && summary.silent.length > 0 ? (
++          <p>{t("projects.storage.keep.silent", { studios: names(summary.silent) })}</p>
++        ) : null}
++      </div>
++    </section>
++  );
++}
+diff --git a/components/projects/storage-panel.tsx b/components/projects/storage-panel.tsx
+index a46ce22..e65fe0e 100644
+--- a/components/projects/storage-panel.tsx
++++ b/components/projects/storage-panel.tsx
+@@ -4,12 +4,14 @@ import { useState } from "react";
+ import { toast } from "sonner";
+ 
+ import { useI18n } from "@/components/layout/locale-provider";
++import { KeepOffline } from "@/components/projects/keep-offline";
+ import { Button } from "@/components/ui/button";
+ import { Panel } from "@/components/ui/panel";
+ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+ import { safeDb } from "@/lib/db";
+ import type { ProjectVersion } from "@/lib/projects/history";
+ import { listAllVersions, removeVersions, restoreVersions } from "@/lib/projects/versions";
++import { KEPT_STUDIOS_EVENT } from "@/lib/pwa/keep-studios";
+ import { sizesByProject, trimDays, versionsToTrim } from "@/lib/projects/trim";
+ import { projectName } from "@/lib/projects/types";
+ import {
+@@ -77,6 +79,8 @@ export function StoragePanel() {
+     if (typeof caches === "undefined") return;
+     const store: CacheStore = { keys: () => caches.keys(), delete: (name) => caches.delete(name) };
+     await clearOfflineCaches(store);
++    // The studios are no longer kept: the list below and the sidebar look again.
++    window.dispatchEvent(new Event(KEPT_STUDIOS_EVENT));
+     toast.success(t("projects.storage.cleared"));
+     await check();
+   }
+@@ -192,6 +196,7 @@ export function StoragePanel() {
+           </div>
+         </div>
+       ) : null}
++      <KeepOffline onKept={() => (report ? void check() : undefined)} />
+     </Panel>
+   );
+ }
+diff --git a/docs/faq.md b/docs/faq.md
+index 28025f2..e0f6ec2 100644
+--- a/docs/faq.md
++++ b/docs/faq.md
+@@ -8,7 +8,7 @@ See the [storage guide](storage.md) for exactly what is stored and where.
+ 
+ ## Does DesignHub work offline?
+ 
+-A studio works offline once you have opened it online on that device: the first time a studio is shown, DesignHub keeps its page and files. A studio you never opened online says so when you are offline, and works after you open it once with a connection. Icon search through Iconify and Google Fonts previews require an internet connection.
++A studio works offline once you have opened it online on that device: the first time a studio is shown, DesignHub keeps its page and files. A studio you never opened online says so when you are offline, and works after you open it once with a connection. If you are about to lose your connection, you do not have to open each studio: **Brand Projects, Storage, Keep studios for offline use** lists the studios, and **Keep selected** downloads the ones you tick now, with the size added, before you go offline. Nothing is downloaded until you press it. Icon search through Iconify and Google Fonts previews require an internet connection.
+ 
+ On the hosted site, a small app shell is installed at once and each studio is added as you open it.
+ 
+diff --git a/docs/storage.md b/docs/storage.md
+index 0de1bbf..5589889 100644
+--- a/docs/storage.md
++++ b/docs/storage.md
+@@ -60,6 +60,18 @@ Manual test plan: build and start the app, install it from Chrome, export a proj
+ 
+ **Brand Projects, Storage** shows what DesignHub keeps on this device: the number and size of projects, version history, the icon cache and the offline caches, and the share of the space this browser allows. Only counts and sizes are read; no project content is shown or sent. **Clear the offline cache** deletes the `designhub-static-*` and `designhub-runtime-*` caches and nothing else (projects, settings and the share cache stay), and the studios you opened are kept again the next time you open them with a connection.
+ 
++## Keeping studios for offline use now
++
++A studio is kept for offline use the first time it is shown with a connection. For someone about to lose theirs, **Brand Projects, Storage, Keep studios for offline use** keeps studios ahead of time. It lists every studio with a checkbox and whether it is **Kept** or **Not kept**; **Select all not kept** ticks the rest, and **Keep selected** sends the service worker one message per studio, one after the other, with progress ("Keeping studio 2 of 5") and the size added so far.
++
++- **Nothing is downloaded until you press Keep selected.** Opening the panel, ticking a box or loading the page fetches nothing.
++- **A studio is kept whole or not at all.** Its files are stored first and its page last, and the page is stored only when every file is. If a download fails, that studio stays **Not kept**, the others are unaffected, and pressing **Keep selected** again fetches only what is missing.
++- **If something does not fit,** the panel says which studios are not ready and whether the device ran out of room (clear the offline cache or delete old versions, then try again) or a download failed (check the connection). Kept studios live in the `designhub-static-*` cache, which has no file limit, so the 300 file limit of the runtime cache never removes one and keeping studios never pushes out what the runtime cache holds.
++- **It needs the service worker to control the page.** That is the hosted site or a production build, a few seconds after the first visit and after a reload. In development, or before then, the panel says the worker is not running and the checkboxes are hidden.
++- **The sidebar marker follows.** A studio that is kept gets the "Available offline" marker straight away, with no reload, and **Clear the offline cache** takes the markers away again.
++
++For contributors: the page sends `{ type: "REMEMBER_ROUTE", pathname }` with a `MessagePort`, and the worker answers on it with `{ pathname, status, files, bytes, failed, full }` (`rememberRoute` in `scripts/service-worker-source.mjs`; the page side is `lib/pwa/keep-studios.ts`). A message without a port, which is what a page sends to say which studio it shows, still keeps the studio and gets no answer.
++
+ ## Trimming old versions
+ 
+ The Storage panel lists the projects that take the most room, with their history counted apart. **Delete versions older than** 30, 90 or 365 days shows how many versions that would remove, deletes them, and offers an Undo. The newest version of each project is always kept, and only the oldest part of a history is removed, so what is left is still a whole chain (see [Version history](#version-history)).
+diff --git a/hooks/use-kept-studios.ts b/hooks/use-kept-studios.ts
+index 55a9b66..2403f13 100644
+--- a/hooks/use-kept-studios.ts
++++ b/hooks/use-kept-studios.ts
+@@ -4,11 +4,12 @@ import { usePathname } from "next/navigation";
+ import { useEffect, useState } from "react";
+ 
+ import { studios } from "@/lib/navigation";
++import { KEPT_STUDIOS_EVENT } from "@/lib/pwa/keep-studios";
+ 
+ /**
+  * The studios whose page is in the offline caches, so they open without a connection, and whether the browser is
+  * offline now. Looked up again when the page changes (the worker keeps a studio a moment after it is shown) and
+- * when the connection comes or goes. Empty where there is no service worker or no Cache Storage.
++ * when the connection comes or goes, and when the Storage panel has kept a studio. Empty where there is no service worker or no Cache Storage.
+  */
+ export function useKeptStudios(): { kept: ReadonlySet<string>; offline: boolean } {
+   const pathname = usePathname();
+@@ -34,11 +35,13 @@ export function useKeptStudios(): { kept: ReadonlySet<string>; offline: boolean
+     setOffline(!navigator.onLine);
+     window.addEventListener("online", update);
+     window.addEventListener("offline", update);
++    window.addEventListener(KEPT_STUDIOS_EVENT, update);
+     return () => {
+       current = false;
+       clearTimeout(later);
+       window.removeEventListener("online", update);
+       window.removeEventListener("offline", update);
++      window.removeEventListener(KEPT_STUDIOS_EVENT, update);
+     };
+   }, [pathname]);
+ 
+diff --git a/lib/i18n/messages/en.ts b/lib/i18n/messages/en.ts
+index 2a1ea5e..60e0d0c 100644
+--- a/lib/i18n/messages/en.ts
++++ b/lib/i18n/messages/en.ts
+@@ -247,6 +247,23 @@ export const en = {
+   "projects.storage.clear": "Clear the offline cache",
+   "projects.storage.clearHint": "This removes only the offline copies of studios. Your projects and settings stay.",
+   "projects.storage.cleared": "Offline cache cleared",
++  "projects.storage.keep.title": "Keep studios for offline use",
++  "projects.storage.keep.description":
++    "Download studios now, while you have a connection, so they open without one. Nothing is downloaded until you press Keep selected.",
++  "projects.storage.keep.unavailable":
++    "Keeping studios needs the service worker, which is not running on this page. On the hosted site it starts a few seconds after the first visit and takes control after a reload.",
++  "projects.storage.keep.kept": "Kept",
++  "projects.storage.keep.notKept": "Not kept",
++  "projects.storage.keep.selectAll": "Select all not kept",
++  "projects.storage.keep.button": "Keep selected",
++  "projects.storage.keep.progress": "Keeping studio {current} of {total}, {size} added so far",
++  "projects.storage.keep.done.one": "{count} studio is ready offline. {size} added.",
++  "projects.storage.keep.done.other": "{count} studios are ready offline. {size} added.",
++  "projects.storage.keep.failed":
++    "Not ready offline: {studios}. A download failed, so check the connection and try again.",
++  "projects.storage.keep.full":
++    "Not ready offline: {studios}. There was not enough room on this device. Clear the offline cache or delete old versions, then try again.",
++  "projects.storage.keep.silent": "The service worker did not answer for {studios}. Reload the page and try again.",
+   "projects.select": "Select",
+   "projects.selectNamed": "Select {name}",
+   "projects.bulk.label": "Actions for the selected projects",
+diff --git a/lib/i18n/messages/es.ts b/lib/i18n/messages/es.ts
+index 2ef38b4..37c98b1 100644
+--- a/lib/i18n/messages/es.ts
++++ b/lib/i18n/messages/es.ts
+@@ -245,6 +245,24 @@ export const es = {
+   "projects.storage.clearHint":
+     "Solo elimina las copias sin conexión de los estudios. Tus proyectos y ajustes se conservan.",
+   "projects.storage.cleared": "Caché sin conexión borrada",
++  "projects.storage.keep.title": "Guardar estudios para usarlos sin conexión",
++  "projects.storage.keep.description":
++    "Descarga estudios ahora, mientras tienes conexión, para que se abran sin ella. No se descarga nada hasta que pulses Guardar selección.",
++  "projects.storage.keep.unavailable":
++    "Guardar estudios necesita el service worker, que no está activo en esta página. En el sitio alojado arranca unos segundos después de la primera visita y toma el control al recargar.",
++  "projects.storage.keep.kept": "Guardado",
++  "projects.storage.keep.notKept": "Sin guardar",
++  "projects.storage.keep.selectAll": "Seleccionar los que faltan",
++  "projects.storage.keep.button": "Guardar selección",
++  "projects.storage.keep.progress": "Guardando estudio {current} de {total}, {size} añadidos hasta ahora",
++  "projects.storage.keep.done.one": "{count} estudio está listo sin conexión. Se añadieron {size}.",
++  "projects.storage.keep.done.other": "{count} estudios están listos sin conexión. Se añadieron {size}.",
++  "projects.storage.keep.failed":
++    "Sin conexión no estarán listos: {studios}. Falló una descarga; comprueba la conexión y vuelve a intentarlo.",
++  "projects.storage.keep.full":
++    "Sin conexión no estarán listos: {studios}. No había espacio suficiente en este dispositivo. Borra la caché sin conexión o elimina versiones antiguas y vuelve a intentarlo.",
++  "projects.storage.keep.silent":
++    "El service worker no respondió para {studios}. Recarga la página y vuelve a intentarlo.",
+   "projects.select": "Seleccionar",
+   "projects.selectNamed": "Seleccionar {name}",
+   "projects.bulk.label": "Acciones para los proyectos seleccionados",
+diff --git a/lib/i18n/messages/fr.ts b/lib/i18n/messages/fr.ts
+index 05e8900..10161bb 100644
+--- a/lib/i18n/messages/fr.ts
++++ b/lib/i18n/messages/fr.ts
+@@ -247,6 +247,23 @@ export const fr = {
+   "projects.storage.clearHint":
+     "Cela supprime seulement les copies hors ligne des ateliers. Vos projets et réglages restent.",
+   "projects.storage.cleared": "Cache hors ligne vidé",
++  "projects.storage.keep.title": "Conserver des ateliers pour une utilisation hors ligne",
++  "projects.storage.keep.description":
++    "Téléchargez des ateliers maintenant, tant que vous avez une connexion, pour qu'ils s'ouvrent sans elle. Rien n'est téléchargé tant que vous n'appuyez pas sur Conserver la sélection.",
++  "projects.storage.keep.unavailable":
++    "Conserver des ateliers nécessite le service worker, qui n'est pas actif sur cette page. Sur le site hébergé, il démarre quelques secondes après la première visite et prend le contrôle après un rechargement.",
++  "projects.storage.keep.kept": "Conservé",
++  "projects.storage.keep.notKept": "Non conservé",
++  "projects.storage.keep.selectAll": "Sélectionner ceux qui manquent",
++  "projects.storage.keep.button": "Conserver la sélection",
++  "projects.storage.keep.progress": "Conservation de l'atelier {current} sur {total}, {size} ajoutés jusqu'ici",
++  "projects.storage.keep.done.one": "{count} atelier est prêt hors ligne. {size} ajoutés.",
++  "projects.storage.keep.done.other": "{count} ateliers sont prêts hors ligne. {size} ajoutés.",
++  "projects.storage.keep.failed":
++    "Pas prêts hors ligne : {studios}. Un téléchargement a échoué, vérifiez la connexion et réessayez.",
++  "projects.storage.keep.full":
++    "Pas prêts hors ligne : {studios}. Il n'y avait pas assez de place sur cet appareil. Videz le cache hors ligne ou supprimez d'anciennes versions, puis réessayez.",
++  "projects.storage.keep.silent": "Le service worker n'a pas répondu pour {studios}. Rechargez la page et réessayez.",
+   "projects.select": "Sélectionner",
+   "projects.selectNamed": "Sélectionner {name}",
+   "projects.bulk.label": "Actions pour les projets sélectionnés",
+diff --git a/lib/i18n/messages/hi.ts b/lib/i18n/messages/hi.ts
+index 0a15958..6fc47ac 100644
+--- a/lib/i18n/messages/hi.ts
++++ b/lib/i18n/messages/hi.ts
+@@ -238,6 +238,23 @@ export const hi = {
+   "projects.storage.clear": "ऑफ़लाइन कैश साफ़ करें",
+   "projects.storage.clearHint": "इससे केवल स्टूडियो की ऑफ़लाइन प्रतियाँ हटती हैं। आपके प्रोजेक्ट और सेटिंग रहती हैं।",
+   "projects.storage.cleared": "ऑफ़लाइन कैश साफ़ हुआ",
++  "projects.storage.keep.title": "ऑफ़लाइन उपयोग के लिए स्टूडियो रखें",
++  "projects.storage.keep.description":
++    "अभी, कनेक्शन होते हुए, स्टूडियो डाउनलोड करें ताकि वे बिना कनेक्शन के खुलें। जब तक आप चुने हुए रखें नहीं दबाते, कुछ डाउनलोड नहीं होता।",
++  "projects.storage.keep.unavailable":
++    "स्टूडियो रखने के लिए सर्विस वर्कर चाहिए, जो इस पेज पर नहीं चल रहा है। होस्ट की गई साइट पर यह पहली विज़िट के कुछ सेकंड बाद शुरू होता है और रीलोड के बाद नियंत्रण लेता है।",
++  "projects.storage.keep.kept": "रखा गया",
++  "projects.storage.keep.notKept": "रखा नहीं गया",
++  "projects.storage.keep.selectAll": "जो नहीं रखे गए उन सबको चुनें",
++  "projects.storage.keep.button": "चुने हुए रखें",
++  "projects.storage.keep.progress": "स्टूडियो {current} / {total} रखा जा रहा है, अब तक {size} जोड़ा गया",
++  "projects.storage.keep.done.one": "{count} स्टूडियो ऑफ़लाइन के लिए तैयार है। {size} जोड़ा गया।",
++  "projects.storage.keep.done.other": "{count} स्टूडियो ऑफ़लाइन के लिए तैयार हैं। {size} जोड़ा गया।",
++  "projects.storage.keep.failed":
++    "ऑफ़लाइन के लिए तैयार नहीं: {studios}। एक डाउनलोड विफल हुआ, कनेक्शन जाँचें और फिर कोशिश करें।",
++  "projects.storage.keep.full":
++    "ऑफ़लाइन के लिए तैयार नहीं: {studios}। इस डिवाइस पर पर्याप्त जगह नहीं थी। ऑफ़लाइन कैश साफ़ करें या पुराने वर्शन हटाएँ, फिर कोशिश करें।",
++  "projects.storage.keep.silent": "{studios} के लिए सर्विस वर्कर ने जवाब नहीं दिया। पेज रीलोड करें और फिर कोशिश करें।",
+   "projects.select": "चुनें",
+   "projects.selectNamed": "{name} चुनें",
+   "projects.bulk.label": "चुने हुए प्रोजेक्ट के लिए कार्य",
+diff --git a/lib/pwa/keep-studios.test.ts b/lib/pwa/keep-studios.test.ts
+new file mode 100644
+index 0000000..c2b5307
+--- /dev/null
++++ b/lib/pwa/keep-studios.test.ts
+@@ -0,0 +1,86 @@
++import { describe, expect, test } from "vitest";
++
++import { keepStudio, keepStudios, summarize, type KeepResult } from "@/lib/pwa/keep-studios";
++
++const done = (pathname: string, extra: Partial<KeepResult> = {}): KeepResult => ({
++  pathname,
++  status: "kept",
++  files: 2,
++  bytes: 1000,
++  failed: 0,
++  full: false,
++  ...extra,
++});
++
++/** A worker that answers each message on the port it was sent, or says nothing when `reply` returns undefined. */
++function worker(reply: (pathname: string) => unknown) {
++  const asked: string[] = [];
++  return {
++    asked,
++    postMessage(message: { type: string; pathname: string }, ports: MessagePort[]) {
++      asked.push(`${message.type} ${message.pathname}`);
++      const answer = reply(message.pathname);
++      if (answer !== undefined) ports[0]?.postMessage(answer);
++    },
++  };
++}
++
++describe("keeping studios from the page", () => {
++  test("sends one message per studio, one after the other, and reports progress and the size so far", async () => {
++    const fake = worker((pathname) => done(pathname, { bytes: pathname.length * 100 }));
++    const progress: { current: number; total: number; bytes: number }[] = [];
++    const results = await keepStudios(fake as never, ["/colors", "/svg"], (step) => progress.push(step));
++    expect(fake.asked).toEqual(["REMEMBER_ROUTE /colors", "REMEMBER_ROUTE /svg"]);
++    expect(progress).toEqual([
++      { current: 1, total: 2, bytes: 0 },
++      { current: 2, total: 2, bytes: 700 },
++    ]);
++    expect(results.map((result) => result.pathname)).toEqual(["/colors", "/svg"]);
++  });
++
++  test("a worker that does not answer is reported as silent after the timeout", async () => {
++    const result = await keepStudio(worker(() => undefined) as never, "/colors", 20);
++    expect(result).toMatchObject({ pathname: "/colors", status: "silent", files: 0, bytes: 0 });
++  });
++
++  test("a worker that cannot be messaged is reported as silent", async () => {
++    const broken = {
++      postMessage: () => {
++        throw new Error("gone");
++      },
++    };
++    expect((await keepStudio(broken as never, "/colors", 20)).status).toBe("silent");
++  });
++
++  test("an answer of the wrong shape is a failure, never a crash", async () => {
++    expect((await keepStudio(worker(() => ({ status: 3, files: "many", bytes: -4 })) as never, "/a")).status).toBe(
++      "failed",
++    );
++    expect((await keepStudio(worker(() => ({ status: "kept", files: "many", bytes: -4 })) as never, "/a")).bytes).toBe(
++      0,
++    );
++    expect((await keepStudio(worker(() => "text") as never, "/a")).status).toBe("silent");
++  });
++});
++
++describe("summarize", () => {
++  test("counts the studios that are ready and the bytes added", () => {
++    expect(summarize([done("/a"), done("/b", { bytes: 500 })])).toEqual({
++      kept: 2,
++      bytes: 1500,
++      notReady: [],
++      silent: [],
++      full: false,
++    });
++  });
++
++  test("names what did not fit, what failed and what did not answer", () => {
++    const summary = summarize([
++      done("/a"),
++      done("/b", { status: "failed", files: 1, bytes: 300, failed: 2, full: true }),
++      done("/c", { status: "unknown", files: 0, bytes: 0 }),
++      done("/d", { status: "silent", files: 0, bytes: 0 }),
++    ]);
++    expect(summary).toEqual({ kept: 1, bytes: 1300, notReady: ["/b", "/c"], silent: ["/d"], full: true });
++  });
++});
+diff --git a/lib/pwa/keep-studios.ts b/lib/pwa/keep-studios.ts
+new file mode 100644
+index 0000000..fafe2c6
+--- /dev/null
++++ b/lib/pwa/keep-studios.ts
+@@ -0,0 +1,111 @@
++/** The window event fired when a studio has been kept, so the sidebar and the studio chooser look again. */
++export const KEPT_STUDIOS_EVENT = "designhub:kept-studios";
++
++/** How long to wait for the worker to answer for one studio. A studio is a few hundred kB, so this is generous. */
++const ANSWER_TIMEOUT = 60_000;
++
++/** What the worker did for one studio. `silent` means no answer came, so nothing is known about it. */
++export type KeepResult = {
++  pathname: string;
++  status: "kept" | "failed" | "unknown" | "silent";
++  /** Files stored by this request (none when the studio was already kept). */
++  files: number;
++  /** Bytes stored by this request. */
++  bytes: number;
++  /** Files that were not stored: a download that failed, or no room left on the device. */
++  failed: number;
++  /** True when the device ran out of room for at least one file. */
++  full: boolean;
++};
++
++export type KeepSummary = {
++  /** Studios that are now ready offline. */
++  kept: number;
++  bytes: number;
++  /** Studios that are not ready: a file could not be stored, or the worker does not know the studio. */
++  notReady: string[];
++  /** Studios the worker never answered for. */
++  silent: string[];
++  full: boolean;
++};
++
++type Worker = Pick<ServiceWorker, "postMessage">;
++
++const silent = (pathname: string): KeepResult => ({
++  pathname,
++  status: "silent",
++  files: 0,
++  bytes: 0,
++  failed: 0,
++  full: false,
++});
++
++/** Reads the worker's answer, which is data from another context: anything unexpected counts as a failure. */
++function readResult(pathname: string, data: unknown): KeepResult {
++  if (typeof data !== "object" || data === null) return silent(pathname);
++  const answer = data as Record<string, unknown>;
++  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
++  const status = answer.status === "kept" || answer.status === "unknown" ? answer.status : "failed";
++  return {
++    pathname,
++    status,
++    files: count(answer.files),
++    bytes: count(answer.bytes),
++    failed: count(answer.failed),
++    full: answer.full === true,
++  };
++}
++
++/** Asks the worker to keep one studio now and waits for its answer. Never rejects. */
++export function keepStudio(worker: Worker, pathname: string, timeout = ANSWER_TIMEOUT): Promise<KeepResult> {
++  return new Promise((resolve) => {
++    const channel = new MessageChannel();
++    const timer = setTimeout(() => finish(silent(pathname)), timeout);
++    function finish(result: KeepResult) {
++      clearTimeout(timer);
++      channel.port1.close();
++      resolve(result);
++    }
++    channel.port1.onmessage = (event: MessageEvent<unknown>) => finish(readResult(pathname, event.data));
++    try {
++      worker.postMessage({ type: "REMEMBER_ROUTE", pathname }, [channel.port2]);
++    } catch {
++      finish(silent(pathname));
++    }
++  });
++}
++
++/**
++ * Keeps the given studios one after the other, one message each, so the connection is not shared by all of them at
++ * once and the person can see how far it has got. `onProgress` is called before each studio, with the bytes stored
++ * so far. Each studio that is kept tells the page, so the sidebar marker appears as it goes.
++ */
++export async function keepStudios(
++  worker: Worker,
++  pathnames: readonly string[],
++  onProgress?: (progress: { current: number; total: number; bytes: number }) => void,
++  timeout?: number,
++): Promise<KeepResult[]> {
++  const results: KeepResult[] = [];
++  let bytes = 0;
++  for (const pathname of pathnames) {
++    onProgress?.({ current: results.length + 1, total: pathnames.length, bytes });
++    const result = await keepStudio(worker, pathname, timeout);
++    results.push(result);
++    bytes += result.bytes;
++    if (typeof window !== "undefined") window.dispatchEvent(new Event(KEPT_STUDIOS_EVENT));
++  }
++  return results;
++}
++
++export function summarize(results: readonly KeepResult[]): KeepSummary {
++  return {
++    kept: results.filter((result) => result.status === "kept").length,
++    bytes: results.reduce((total, result) => total + result.bytes, 0),
++    notReady: results
++      .filter((result) => result.status === "failed" || result.status === "unknown")
++      .map((result) => result.pathname),
++    silent: results.filter((result) => result.status === "silent").map((result) => result.pathname),
++    full: results.some((result) => result.full),
++  };
++}
+diff --git a/lib/pwa/service-worker.test.ts b/lib/pwa/service-worker.test.ts
+index c3b8aa7..8685374 100644
+--- a/lib/pwa/service-worker.test.ts
++++ b/lib/pwa/service-worker.test.ts
+@@ -58,11 +58,11 @@ class FakeCaches {
+ function start(options: Parameters<typeof serviceWorkerSource>[0], caches = new FakeCaches()) {
+   const listeners = new Map<string, Listener>();
+   const fetched: string[] = [];
+-  const state = { online: true };
++  const state = { online: true, broken: new Set<string>() };
+   const fakeFetch = async (request: string | Request) => {
+     const href = new URL(typeof request === "string" ? request : request.url, ORIGIN).href;
+     fetched.push(new URL(href).pathname + new URL(href).search);
+-    if (!state.online) throw new TypeError("offline");
++    if (!state.online || state.broken.has(new URL(href).pathname)) throw new TypeError("offline");
+     return new Response(`body of ${href}`, { status: 200 });
+   };
+   const self = {
+@@ -173,3 +173,100 @@ describe("the service worker", () => {
+     ]);
+   });
+ });
++
++describe("keeping a studio on request", () => {
++  /** A message port that records what the worker answers. */
++  const port = () => {
++    const answers: Record<string, unknown>[] = [];
++    return { answers, postMessage: (answer: Record<string, unknown>) => answers.push(answer) };
++  };
++  const keep = (worker: ReturnType<typeof start>, pathname: string, ports: unknown[] = []) =>
++    worker.fire("message", { data: { type: "REMEMBER_ROUTE", pathname }, ports });
++
++  test("a studio never opened is kept, and the worker says what it stored", async () => {
++    const worker = start(build);
++    await worker.fire("install");
++    worker.fetched.length = 0;
++    const answer = port();
++    await keep(worker, "/typography", [answer]);
++    const body = (path: string) => `body of ${ORIGIN}${path}`.length;
++    expect(answer.answers).toEqual([
++      {
++        pathname: "/typography",
++        status: "kept",
++        files: 2,
++        bytes: body("/_next/static/chunks/typography.js") + body("/typography"),
++        failed: 0,
++        full: false,
++      },
++    ]);
++    const cached = await worker.caches.open("designhub-static-one");
++    expect(await cached.match("/typography")).toBeDefined();
++    expect(await cached.match("/_next/static/chunks/typography.js")).toBeDefined();
++  });
++
++  test("a studio that is already kept stores nothing more, and a path that is no studio says so", async () => {
++    const worker = start(build);
++    await worker.open("/colors", { navigate: true });
++    worker.fetched.length = 0;
++    const kept = port();
++    const unknown = port();
++    await keep(worker, "/colors", [kept]);
++    await keep(worker, "/elsewhere", [unknown]);
++    expect(worker.fetched).toEqual([]);
++    expect(kept.answers[0]).toMatchObject({ status: "kept", files: 0, bytes: 0, failed: 0 });
++    expect(unknown.answers[0]).toMatchObject({ status: "unknown", files: 0 });
++  });
++
++  test("a studio is not kept without all of its files, and the next try fetches only what is missing", async () => {
++    const worker = start({
++      ...build,
++      routeFiles: { ...build.routeFiles, "/effects": ["/_next/static/chunks/a.js", "/_next/static/chunks/b.js"] },
++    });
++    worker.state.broken.add("/_next/static/chunks/b.js");
++    const first = port();
++    await keep(worker, "/effects", [first]);
++    expect(first.answers[0]).toMatchObject({ status: "failed", files: 1, failed: 1, full: false });
++    const cached = await worker.caches.open("designhub-static-one");
++    expect(await cached.match("/effects")).toBeUndefined();
++
++    worker.state.broken.clear();
++    worker.fetched.length = 0;
++    const second = port();
++    await keep(worker, "/effects", [second]);
++    expect(worker.fetched).toEqual(["/_next/static/chunks/b.js", "/effects"]);
++    expect(second.answers[0]).toMatchObject({ status: "kept", files: 2, failed: 0 });
++    expect(await cached.match("/effects")).toBeDefined();
++  });
++
++  test("a device with no room left is reported as full, not as a failed connection", async () => {
++    const caches = new FakeCaches();
++    const worker = start(build, caches);
++    const cache = await caches.open("designhub-static-one");
++    cache.put = async () => {
++      throw new DOMException("no room", "QuotaExceededError");
++    };
++    const answer = port();
++    await keep(worker, "/colors", [answer]);
++    expect(answer.answers[0]).toMatchObject({ status: "failed", files: 0, failed: 1, full: true });
++  });
++
++  test("kept studios are not counted against the runtime cache limit", async () => {
++    const worker = start({ ...build, runtimeLimit: 1 });
++    await keep(worker, "/colors");
++    await keep(worker, "/typography");
++    for (const name of ["a", "b", "c"]) await worker.open(`/_next/static/chunks/${name}.js`);
++    const cached = await worker.caches.open("designhub-static-one");
++    expect(await cached.match("/colors")).toBeDefined();
++    expect(await cached.match("/typography")).toBeDefined();
++    const runtime = await worker.caches.open("designhub-runtime-one");
++    expect(runtime.entries.size).toBe(1);
++  });
++
++  test("a message with no port is answered by nobody and still keeps the studio", async () => {
++    const worker = start(build);
++    await keep(worker, "/colors");
++    const cached = await worker.caches.open("designhub-static-one");
++    expect(await cached.match("/colors")).toBeDefined();
++  });
++});
+diff --git a/scripts/service-worker-source.mjs b/scripts/service-worker-source.mjs
+index 6e04836..088a3a8 100644
+--- a/scripts/service-worker-source.mjs
++++ b/scripts/service-worker-source.mjs
+@@ -5,6 +5,8 @@
+  * - Installing downloads only the shell: the home page, the files every page shares, the icons.
+  * - A studio is remembered the first time it is shown online (by address, or when the page reports it): its
+  *   page and the files it was built from are downloaded then, and anything it loads later is cached as it is used.
++ * - A studio can also be kept on request, before it is ever opened: the page sends REMEMBER_ROUTE with a port and
++ *   gets back what was stored, how many bytes, and what did not fit or did not download.
+  * - A studio never opened online is not promised offline; the page says so instead of failing blank.
+  * - Caches are named by build, and an update deletes the ones from earlier builds.
+  *
+@@ -79,21 +81,37 @@ async function navigate(request) {
+   }
+ }
+ 
+-/** Keeps a studio for offline use: its files first, then its page, so a page is never kept without its files. */
+-async function rememberRoute(pathname) {
++/**
++ * Keeps a studio for offline use: its files first, then its page, so a page is never kept without its files.
++ * Resolves to what happened, for a page that asked: how many files were stored, how many bytes (measured only when
++ * asked), and how many did not make it, with whether the device ran out of room. The files go to the static cache,
++ * which has no file limit, so keeping a studio never pushes another out and the runtime cache limit never removes one.
++ */
++async function rememberRoute(pathname, measure) {
++  const result = { pathname, status: "unknown", files: 0, bytes: 0, failed: 0, full: false };
+   const files = ROUTE_FILES[pathname];
+-  if (!files) return;
++  if (!files) return result;
+   const cache = await caches.open(STATIC_CACHE);
+-  if (await cache.match(pathname)) return;
++  if (await cache.match(pathname)) return { ...result, status: "kept" };
+   const keep = async (url) => {
+     if (await cache.match(url)) return;
+     try {
+       const response = await fetch(url);
+-      if (response.ok) await cache.put(url, response);
+-    } catch {}
++      if (!response.ok) throw new Error("not ok");
++      const size = measure ? (await response.clone().blob()).size : 0;
++      await cache.put(url, response);
++      result.files += 1;
++      result.bytes += size;
++    } catch (error) {
++      result.failed += 1;
++      if (error && error.name === "QuotaExceededError") result.full = true;
++    }
+   };
+   await Promise.all(files.map(keep));
+-  await keep(pathname);
++  // A page kept without all of its files would open offline and load nothing, so it waits until they are all there.
++  if (result.failed === 0) await keep(pathname);
++  result.status = result.failed === 0 ? "kept" : "failed";
++  return result;
+ }
+ 
+ self.addEventListener("install", (event) => {
+@@ -112,7 +130,15 @@ self.addEventListener("activate", (event) => {
+ self.addEventListener("message", (event) => {
+   if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+   // The page says which studio it is showing, so a link followed inside the app keeps its studio too.
+-  if (event.data?.type === "REMEMBER_ROUTE" && typeof event.data.pathname === "string") event.waitUntil(rememberRoute(event.data.pathname));
++  if (event.data?.type === "REMEMBER_ROUTE" && typeof event.data.pathname === "string") {
++    // A page that wants to know how it went sends a port with the message (the Storage panel does); one that only
++    // reports where it is sends none, and gets no answer.
++    const port = event.ports && event.ports[0];
++    const pathname = event.data.pathname;
++    const work = rememberRoute(pathname, Boolean(port));
++    event.waitUntil(work);
++    if (port) work.then((result) => port.postMessage(result), () => port.postMessage({ pathname, status: "failed", files: 0, bytes: 0, failed: 1, full: false }));
++  }
+ });
+ 
+ // A project file shared from another app arrives as a POST. Keep it on the device, in a cache,
+diff --git a/tests/e2e/storage-panel.spec.ts b/tests/e2e/storage-panel.spec.ts
+index 93e29b4..59e62b0 100644
+--- a/tests/e2e/storage-panel.spec.ts
++++ b/tests/e2e/storage-panel.spec.ts
+@@ -81,3 +81,47 @@ test("the panel lists the largest projects and trims old versions with an undo,
+   await expect(page.getByText("Restored 2 versions")).toBeVisible();
+   await expect(page.getByRole("button", { name: "Delete 2 versions" })).toBeVisible();
+ });
++
++test("the storage panel keeps a studio that was never opened, and it then opens with no connection", async ({
++  page,
++  context,
++}) => {
++  // The worker has to control the page before it can answer.
++  await page.goto("/projects");
++  await expect(page.locator("h1").first()).toBeVisible();
++  await page.evaluate(async () => {
++    await navigator.serviceWorker.ready;
++  });
++  await page.reload();
++  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
++  // The Effects Lab has never been opened, so it is not on this device.
++  expect(await page.evaluate(async () => Boolean(await caches.match("/effects", { ignoreSearch: true })))).toBe(false);
++
++  await page.getByRole("button", { name: "Storage", exact: true }).click();
++  const section = page.getByRole("region", { name: "Keep studios for offline use" });
++  const effects = section.getByRole("checkbox", { name: "Effects Lab", exact: true });
++  await expect(section.locator("#keep-offline-effects-state")).toHaveText("Not kept");
++
++  // Nothing is fetched until the button is pressed.
++  await effects.check();
++  expect(await page.evaluate(async () => Boolean(await caches.match("/effects", { ignoreSearch: true })))).toBe(false);
++  await section.getByRole("button", { name: "Keep selected" }).click();
++
++  await expect(section.getByRole("status")).toContainText(/1 studio is ready offline\. .+ added\./, {
++    timeout: 30_000,
++  });
++  await expect(section.locator("#keep-offline-effects-state")).toHaveText("Kept");
++  await expect(effects).toBeDisabled();
++
++  // The sidebar marker follows, without a reload.
++  const nav = page.getByRole("navigation", { name: "Studios" });
++  await expect(
++    nav.getByRole("link", { name: /^Effects Lab/ }).getByRole("img", { name: "Available offline" }),
++  ).toBeVisible();
++
++  // Offline, the studio opens instead of saying it is not on this device.
++  await context.setOffline(true);
++  await page.goto("/effects");
++  await expect(page.locator("h1").first()).toBeVisible();
++  await expect(page.getByRole("heading", { name: "This page is not on this device yet" })).toHaveCount(0);
++});
